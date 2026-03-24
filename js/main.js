@@ -329,18 +329,36 @@ function mapNomadDoc(docSnap) {
 }
 
 
-function operationalDocId(row) {
+function sanitizeOperationalKey(value) {
+  return String(value || "").replace(/[\/#?\[\]]/g, "_").trim();
+}
+
+function legacyOperationalDocId(row) {
   const raw = String(row?.folio || `${row?.marca || "ROW"}-${row?.idFirestore || "SINID"}`);
-  return raw.replace(/[\/#?\[\]]/g, "_").trim();
+  return sanitizeOperationalKey(raw);
+}
+
+function operationalDocId(row) {
+  const sourceKey = [
+    row?.marca || "ROW",
+    row?.sourceProject || "NOPROJECT",
+    row?.sourceCollection || "NOCOLLECTION",
+    row?.sourceDocId || row?.idFirestore || "SINID"
+  ].join("__");
+  return sanitizeOperationalKey(sourceKey);
 }
 
 function mergeOperationalData(row) {
-  const op = embudoMap.get(operationalDocId(row));
+  const exactKey = operationalDocId(row);
+  const legacyKey = legacyOperationalDocId(row);
+  const exactOp = embudoMap.get(exactKey);
+  const legacyOp = exactOp ? null : embudoMap.get(legacyKey);
+  const op = exactOp || legacyOp;
   if (!op) return row;
   const payment = op.payment || {};
   const scheduling = op.scheduling || {};
   const seguimiento = op.seguimiento || {};
-  return {
+  const merged = {
     ...row,
     sede: op.sede || row.sede || "",
     status1: seguimiento.status1 || row.status1 || "Sin seguimiento",
@@ -360,11 +378,25 @@ function mergeOperationalData(row) {
     diagnostico: normalizeMixedValue(scheduling.diagnostico || row.diagnostico || ""),
     medico: op.medico || row.medico || "",
     programadoPor: scheduling.programadoPor || row.programadoPor || "",
-    programacionNotas: scheduling.notas || row.programacionNotas || "",
-    sourceProject: op.sourceProject || row.sourceProject,
-    sourceCollection: op.sourceCollection || row.sourceCollection,
-    sourceDocId: op.sourceDocId || row.sourceDocId
+    programacionNotas: scheduling.notas || row.programacionNotas || ""
   };
+
+  // IMPORTANTE:
+  // Si el registro viene del documento legado por folio compartido,
+  // NO debemos pisar los identificadores source* de la fila original,
+  // porque eso haría que varias cotizaciones diferentes apunten al mismo
+  // documento individual y vuelvan a cruzarse.
+  if (exactOp) {
+    merged.sourceProject = op.sourceProject || row.sourceProject;
+    merged.sourceCollection = op.sourceCollection || row.sourceCollection;
+    merged.sourceDocId = op.sourceDocId || row.sourceDocId;
+  } else {
+    merged.sourceProject = row.sourceProject;
+    merged.sourceCollection = row.sourceCollection;
+    merged.sourceDocId = row.sourceDocId;
+  }
+
+  return merged;
 }
 
 async function saveOperationalData(row, overrides = {}) {
@@ -407,7 +439,7 @@ async function saveOperationalData(row, overrides = {}) {
     seguimiento,
     updatedAt: serverTimestamp()
   };
-  const existing = embudoMap.get(opId);
+  const existing = embudoMap.get(opId) || embudoMap.get(legacyOperationalDocId(row));
   if (!existing || !existing.createdAt) payload.createdAt = serverTimestamp();
   console.log("Guardando en embudo-innvida", opId, payload);
   await setDoc(doc(dbEmbudo, EMBUDO_COLLECTION, opId), payload, { merge: true });
