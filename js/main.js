@@ -187,8 +187,36 @@ function normalizarFecha(valor) {
   if (!valor) return "";
   if (typeof valor === "string") return valor.slice(0, 10);
   if (valor?.seconds) return new Date(valor.seconds * 1000).toISOString().slice(0, 10);
+  if (typeof valor?.toDate === "function") return valor.toDate().toISOString().slice(0, 10);
   if (valor instanceof Date) return valor.toISOString().slice(0, 10);
   return "";
+}
+
+function primeraFechaValida(...valores) {
+  for (const valor of valores) {
+    const fecha = normalizarFecha(valor);
+    if (fecha) return fecha;
+  }
+  return "";
+}
+
+function calcularFechaOperativa(row = {}, op = {}) {
+  const payment = op.payment || row.payment || {};
+  const scheduling = op.scheduling || row.scheduling || {};
+  const seguimiento = op.seguimiento || row.seguimiento || {};
+  return primeraFechaValida(
+    payment.fechaPago,
+    row.pagoFecha,
+    scheduling.fechaInfusion,
+    row.programacionFecha,
+    seguimiento.fechaCierre,
+    seguimiento.fechaAceptacion,
+    op.fechaCierre,
+    row.fechaCierre,
+    op.createdAt,
+    row.createdAt,
+    row.fechaEmision
+  );
 }
 
 function normalizarHora(valor) {
@@ -252,6 +280,8 @@ function mapSanareDoc(docSnap) {
     idFirestore: docSnap.id,
     folio: data.folio || docSnap.id,
     fechaEmision: normalizarFecha(data.fechaEmision || data.createdAt),
+    fechaOperativa: calcularFechaOperativa({ ...data, fechaEmision: normalizarFecha(data.fechaEmision || data.createdAt), pagoFecha: normalizarFecha(payment.fechaPago), programacionFecha: normalizarFecha(scheduling.fechaInfusion || data.fechaProgramacion) }),
+    createdAt: data.createdAt,
     paciente: data.paciente || "",
     medico: scheduling.medico || data.medico || "",
     kam: data.kam || "",
@@ -296,6 +326,8 @@ function mapNomadDoc(docSnap) {
     idFirestore: docSnap.id,
     folio: data.folio || docSnap.id,
     fechaEmision: normalizarFecha(data.fechaEmision || data.createdAt),
+    fechaOperativa: calcularFechaOperativa({ ...data, fechaEmision: normalizarFecha(data.fechaEmision || data.createdAt), pagoFecha: normalizarFecha(payment.fechaPago), programacionFecha: normalizarFecha(scheduling.fechaInfusion || data.fechaProgramacion) }),
+    createdAt: data.createdAt,
     paciente: data.paciente || "",
     medico: scheduling.medico || data.medico || "",
     kam: data.kam || "",
@@ -354,7 +386,7 @@ function mergeOperationalData(row) {
   const exactOp = embudoMap.get(exactKey);
   const legacyOp = exactOp ? null : embudoMap.get(legacyKey);
   const op = exactOp || legacyOp;
-  if (!op) return row;
+  if (!op) return { ...row, fechaOperativa: calcularFechaOperativa(row) || row.fechaEmision || "" };
   const payment = op.payment || {};
   const scheduling = op.scheduling || {};
   const seguimiento = op.seguimiento || {};
@@ -378,7 +410,9 @@ function mergeOperationalData(row) {
     diagnostico: normalizeMixedValue(scheduling.diagnostico || row.diagnostico || ""),
     medico: op.medico || row.medico || "",
     programadoPor: scheduling.programadoPor || row.programadoPor || "",
-    programacionNotas: scheduling.notas || row.programacionNotas || ""
+    programacionNotas: scheduling.notas || row.programacionNotas || "",
+    fechaOperativa: calcularFechaOperativa(row, op),
+    operationalCreatedAt: op.createdAt || row.operationalCreatedAt || ""
   };
 
   // IMPORTANTE:
@@ -460,14 +494,71 @@ function initRealtimeListeners() {
   }, err => console.error("Nomad listener error", err));
 
   onSnapshot(collection(dbEmbudo, EMBUDO_COLLECTION), snap => {
-    embudoMap = new Map(snap.docs.map(d => [d.id, d.data()]));
+    embudoMap = new Map(snap.docs.map(d => [d.id, { ...d.data(), __opId: d.id }]));
     setSaveStatus(`Embudo conectado · ${snap.size} registros operativos`, "info");
     recomputeAll();
   }, err => { console.error("Embudo listener error", err); setSaveStatus("No se pudo leer embudo-innvida", "error"); showToast("Error leyendo embudo-innvida", "error"); });
 }
 
+function mapOperationalOnlyDoc(op = {}) {
+  const payment = op.payment || {};
+  const scheduling = op.scheduling || {};
+  const seguimiento = op.seguimiento || {};
+  const id = op.sourceDocId || op.__opId || op.folio || "";
+  const fechaEmision = normalizarFecha(op.fechaEmision || op.createdAt);
+
+  return {
+    marca: op.marca || "OPERATIVO",
+    collection: op.sourceCollection || "cotizaciones",
+    idFirestore: id,
+    folio: op.folio || id,
+    fechaEmision,
+    fechaOperativa: calcularFechaOperativa({ ...op, fechaEmision }, op),
+    createdAt: op.createdAt || "",
+    paciente: op.paciente || "",
+    medico: op.medico || scheduling.medico || "",
+    kam: op.kam || "",
+    aseguradora: op.aseguradora || "",
+    telefono: op.telefono || "",
+    sede: op.sede || scheduling.sede || "",
+    total: Number(op.total || payment.montoPagado || 0),
+    status1: seguimiento.status1 || op.status1 || "Sin seguimiento",
+    pagoStatus: payment.status || "Pendiente de pago",
+    pagoFecha: normalizarFecha(payment.fechaPago),
+    pagoMonto: Number(payment.montoPagado || op.total || 0),
+    pagoMetodo: payment.metodo || "",
+    pagoRegistradoPor: payment.registradoPor || "",
+    pagoNotas: payment.notas || op.motivo || "",
+    programacionStatus: scheduling.status || "Sin programación",
+    programacionFecha: normalizarFecha(scheduling.fechaInfusion || op.fechaProgramacion),
+    programacionHora: normalizarHora(scheduling.horaCita),
+    servicio: normalizeMixedValue(scheduling.servicio || op.tipoServicio || "INFUSION"),
+    ciclo: normalizeMixedValue(scheduling.ciclo || op.ciclo || ""),
+    tipoTratamiento: normalizeMixedValue(scheduling.tipoTratamiento || op.tipoTratamiento || ""),
+    tratamiento: normalizeMixedValue(scheduling.tratamiento || op.tratamiento || op.esquema || ""),
+    diagnostico: normalizeMixedValue(scheduling.diagnostico || op.diagnostico || op.dx || ""),
+    programadoPor: scheduling.programadoPor || "",
+    programacionNotas: scheduling.notas || "",
+    direccion: op.direccion || "",
+    sourceProject: op.sourceProject || "embudo-innvida",
+    sourceCollection: op.sourceCollection || "seguimiento_operativo",
+    sourceDocId: op.sourceDocId || op.__opId || "",
+    origenData: op,
+    onlyOperational: true
+  };
+}
+
 function recomputeAll() {
-  allRows = [...sanareRows, ...nomadRows].map(mergeOperationalData).sort((a, b) => (b.fechaEmision || "").localeCompare(a.fechaEmision || ""));
+  const baseRows = [...sanareRows, ...nomadRows].map(mergeOperationalData);
+  const sourceKeys = new Set(baseRows.map(r => `${r.sourceProject || ""}__${r.sourceCollection || ""}__${r.sourceDocId || r.idFirestore || ""}`));
+  const operationalOnlyRows = Array.from(embudoMap.values())
+    .filter(op => {
+      const key = `${op.sourceProject || ""}__${op.sourceCollection || ""}__${op.sourceDocId || ""}`;
+      return !op.sourceDocId || !sourceKeys.has(key);
+    })
+    .map(mapOperationalOnlyDoc);
+
+  allRows = [...baseRows, ...operationalOnlyRows].sort((a, b) => (b.fechaOperativa || b.fechaEmision || "").localeCompare(a.fechaOperativa || a.fechaEmision || ""));
   $("ultimaActualizacion").textContent = `Actualizado: ${new Date().toLocaleString("es-MX")}`;
   applyFilters();
 }
@@ -476,8 +567,8 @@ function applyFilters() {
   let rows = [...allRows];
   const marcas = filtrosMarca.filter(cb => cb.checked).map(cb => cb.value);
   if (marcas.length) rows = rows.filter(r => marcas.includes(r.marca));
-  if (filtroFechaInicio.value) rows = rows.filter(r => r.fechaEmision >= filtroFechaInicio.value);
-  if (filtroFechaFin.value) rows = rows.filter(r => r.fechaEmision <= filtroFechaFin.value);
+  if (filtroFechaInicio.value) rows = rows.filter(r => (r.fechaOperativa || r.fechaEmision || "") >= filtroFechaInicio.value);
+  if (filtroFechaFin.value) rows = rows.filter(r => (r.fechaOperativa || r.fechaEmision || "") <= filtroFechaFin.value);
 
   const text = filtroTexto.value.trim().toLowerCase();
   if (text) {
@@ -535,7 +626,8 @@ function renderTable(rows) {
       <td>${escapeHtml(row.paciente)}</td>
       <td>${escapeHtml(row.medico)}</td>
       <td>${escapeHtml(row.kam)}</td>
-      <td>${escapeHtml(row.fechaEmision)}</td>
+      <td>${escapeHtml(row.fechaOperativa || row.fechaEmision || "—")}</td>
+      <td>${escapeHtml(row.fechaEmision || "—")}</td>
       <td class="money">${formatearMoneda(row.total)}</td>
       <td>${escapeHtml(row.status1)}</td>
       <td>${paymentBadge(row.pagoStatus)}</td>
@@ -705,6 +797,7 @@ function openDrawer(id) {
 
   $("drawerResumen").innerHTML = [
     ["Total cotizado", formatearMoneda(selectedRow.total)],
+    ["Fecha operativa", selectedRow.fechaOperativa || selectedRow.fechaEmision || "—"],
     ["Fecha emisión", selectedRow.fechaEmision || "—"],
     ["KAM", selectedRow.kam || "—"],
     ["Aseguradora", selectedRow.aseguradora || "—"],
